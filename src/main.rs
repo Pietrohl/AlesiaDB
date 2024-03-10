@@ -1,6 +1,5 @@
 pub mod types;
 use crate::types::dto::{ColumnData, QueryDTO, ResponseDTO};
-use base64::{engine::general_purpose, Engine as _};
 use rusqlite::Connection;
 use std::borrow::Borrow;
 use std::str::from_utf8;
@@ -11,6 +10,7 @@ use types::dto::{DataType, TableRow};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // print_test();
 
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
     println!("Server started on 127.0.0.1:8080");
@@ -54,16 +54,10 @@ async fn handle_message(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let msg = String::from_utf8((&bytes[..n]).to_vec())?;
 
-    let decoded_buf = general_purpose::STANDARD.decode(msg)?;
-
-    let decoded_msg = from_utf8(&decoded_buf)?;
-
-    println!("decoded: {0}", &decoded_msg);
-
-    let query: QueryDTO = serde_json::from_str(decoded_msg)?;
+    let query: QueryDTO = serde_json::from_str(&msg)?;
 
     let response = match execute_sql_query(&query).await {
-        Ok(result) => general_purpose::STANDARD.encode(serde_json::to_string(&result)?.as_bytes()),
+        Ok(result) => serde_json::to_string(&result)?,
         Err(err) => format!("Error: {}", err),
     };
 
@@ -147,4 +141,22 @@ async fn execute_sql_query(
         Ok(result)
     }
 }
+// fn print_test() -> Vec<u8> {
+//     let message = QueryDTO {
+//         query: "SELECT * FROM clients WHERE id = ?1;".to_string().into(),
+//         params: vec![ColumnData {
+//             data: "1".into(),
+//             data_type: DataType::INTEGER,
+//         }],
+//     };
 
+//     let result = serde_json::to_string(&message).unwrap();
+//     let result_as_bytes = result.as_bytes();
+
+//     println!(
+//         "The message should be: {0}",
+//         from_utf8(&result_as_bytes).unwrap()
+//     );
+
+//     return result_as_bytes.into();
+// }
