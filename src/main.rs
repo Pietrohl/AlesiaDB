@@ -5,40 +5,55 @@ use rusqlite::types::ToSql;
 use rusqlite::Connection;
 use std::borrow::Borrow;
 use std::str::from_utf8;
+use std::sync::{Arc, Mutex};
 use std::vec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+type SafeConnection = Arc<Mutex<Connection>>;
+
+struct Server {
+    listener: TcpListener,
+    conn: SafeConnection,
+}
+
+impl Server {
+    pub async fn new(url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(url).await?;
+        let conn = Arc::new(Mutex::new(Connection::open("sqlite.db")?));
+        println!("Server started on {url}");
+
+        Ok(Server { listener, conn })
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let server = Server::new("localhost:8080").await?;
+    let server = Server::new("127.0.0.1:8080").await?;
 
+    run_server(server).await
+}
+
+async fn run_server(server: Server) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (socket, _) = server.listener.accept().await?;
         println!("Accepted connection from: {}", socket.peer_addr()?);
 
+        let conn_clone = server.conn.clone(); // Clone the Arc<Mutex<Connection>>
+
         tokio::spawn(async move {
-            if let Err(e) = handle_client(socket).await {
+            if let Err(e) = handle_client(socket, &conn_clone).await {
+                // Pass the cloned connection
                 eprintln!("Error handling client: {}", e);
             }
         });
     }
 }
 
-struct Server {
-    listener: TcpListener,
-}
-
-impl Server {
-    pub async fn new(url: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind(url).await?;
-        println!("Server started on {url}");
-
-        Ok(Server { listener })
-    }
-}
-
-async fn handle_client(mut socket: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_client(
+    mut socket: TcpStream,
+    conn: &Arc<Mutex<Connection>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut bytes = [0; 1024];
     let addr = socket.peer_addr()?;
     println!("Handling client: {}", addr);
@@ -50,10 +65,11 @@ async fn handle_client(mut socket: TcpStream) -> Result<(), Box<dyn std::error::
             return Ok(());
         }
 
-        let result: String = handle_message(&bytes, n - 1)
+        let result: String = handle_message(&bytes, n - 1, conn)
             .await
             .map_or_else(|e| format!("Error handling message: {}", e), |r| r);
 
+        println!("Result: {}", result);
         socket.write_all(result.as_bytes()).await?;
         // socket.write_all(b"\n").await?;
     }
@@ -62,15 +78,16 @@ async fn handle_client(mut socket: TcpStream) -> Result<(), Box<dyn std::error::
 async fn handle_message(
     bytes: &[u8; 1024],
     n: usize,
+    conn: &Arc<Mutex<Connection>>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let msg = String::from_utf8((&bytes[..n]).to_vec())?;
 
     let query: RequestDTO = serde_json::from_str(&msg)?;
 
     let result = match query.query_type {
-        QueryType::QUERY => execute_sql_query(&query).await,
-        QueryType::EXEC => execute_sql_stm(&query).await,
-        QueryType::INSERT => execute_sql_insert(&query),
+        QueryType::QUERY => execute_sql_query(&query, conn).await,
+        QueryType::EXEC => execute_sql_stm(&query, conn).await,
+        QueryType::INSERT => execute_sql_insert(&query, conn).await,
     };
 
     let response = match result {
@@ -83,10 +100,10 @@ async fn handle_message(
 
 async fn execute_sql_stm(
     query_msg: &RequestDTO,
+    conn: &Arc<Mutex<Connection>>,
 ) -> Result<ResponseDTO, Box<dyn std::error::Error>> {
-    let conn: Connection = Connection::open("sqlite.db").unwrap();
-
-    let mut stmt = conn.prepare(query_msg.query.as_ref()).unwrap();
+    let conn_lock = conn.lock().unwrap();
+    let mut stmt = conn_lock.prepare(query_msg.query.as_ref()).unwrap();
 
     for i in 0..query_msg.params.len() {
         let err = stmt.raw_bind_parameter(i + 1, query_msg.params[i].data.to_sql()?);
@@ -110,11 +127,12 @@ async fn execute_sql_stm(
 
 async fn execute_sql_query(
     query_msg: &RequestDTO,
+    conn: &Arc<Mutex<Connection>>,
 ) -> Result<ResponseDTO, Box<dyn std::error::Error>> {
-    let conn: Connection = Connection::open("sqlite.db")?;
+    let conn_lock = conn.lock().unwrap();
 
     {
-        let mut stmt = conn.prepare(query_msg.query.as_ref())?;
+        let mut stmt = conn_lock.prepare(query_msg.query.as_ref())?;
 
         for i in 0..query_msg.params.len() {
             let err = stmt.raw_bind_parameter(i + 1, query_msg.params[i].data.to_sql()?);
@@ -194,10 +212,12 @@ async fn execute_sql_query(
     }
 }
 
-fn execute_sql_insert(query_msg: &RequestDTO) -> Result<ResponseDTO, Box<dyn std::error::Error>> {
-    let conn: Connection = Connection::open("sqlite.db")?;
-
-    let mut stmt = conn.prepare(&query_msg.query)?;
+async fn execute_sql_insert(
+    query_msg: &RequestDTO,
+    conn: &Arc<Mutex<Connection>>,
+) -> Result<ResponseDTO, Box<dyn std::error::Error>> {
+    let conn_lock = conn.lock().unwrap();
+    let mut stmt = conn_lock.prepare(&query_msg.query)?;
 
     for i in 0..query_msg.params.len() {
         let err = stmt.raw_bind_parameter(i + 1, query_msg.params[i].data.to_sql()?);
@@ -218,5 +238,158 @@ fn execute_sql_insert(query_msg: &RequestDTO) -> Result<ResponseDTO, Box<dyn std
             column_names: vec![],
         }),
         Err(err) => Err(Box::new(err)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::windows::thread;
+
+    use super::*;
+    #[tokio::test]
+    async fn test_execute_sql_select() {
+        // Mock the connection
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let query_msg = RequestDTO {
+            query: "SELECT * FROM users".to_string(),
+            query_type: QueryType::QUERY,
+            params: vec![],
+        };
+
+        // Insert test data into the database
+        conn.lock()
+            .unwrap()
+            .execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
+            .unwrap();
+        conn.lock()
+            .unwrap()
+            .execute("INSERT INTO users (name) VALUES ('John'), ('Jane')", [])
+            .unwrap();
+
+        // Execute the SQL select query
+        let result = execute_sql_query(&query_msg, &conn).await.unwrap();
+
+        // Assert the result
+        assert_eq!(result.rows_affected, 0);
+        assert_eq!(result.status, "OK");
+        assert_eq!(result.column_count, 2);
+        assert_eq!(result.column_names, vec!["id", "name"]);
+
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].columns.len(), 2);
+        assert_eq!(result.rows[0].columns[0].data, "1");
+        assert!(matches!(
+            result.rows[0].columns[0].data_type,
+            DataType::INTEGER
+        ));
+        assert_eq!(result.rows[0].columns[1].data, "John");
+        assert!(matches!(
+            result.rows[0].columns[1].data_type,
+            DataType::TEXT
+        ));
+
+        assert_eq!(result.rows[1].columns.len(), 2);
+        assert_eq!(result.rows[1].columns[0].data, "2");
+        assert!(matches!(
+            result.rows[1].columns[0].data_type,
+            DataType::INTEGER
+        ));
+        assert_eq!(result.rows[1].columns[1].data, "Jane");
+        assert!(matches!(
+            result.rows[1].columns[1].data_type,
+            DataType::TEXT
+        ));
+
+        conn.lock()
+            .unwrap()
+            .execute("DROP TABLE users", [])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_execute_sql_insert() {
+        // Mock the connection
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+
+        // Insert test data into the database
+        conn.lock()
+            .unwrap()
+            .execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
+            .unwrap();
+
+        let query_msg = RequestDTO {
+            query: "INSERT INTO users (name) VALUES (?)".to_string(),
+            query_type: QueryType::INSERT,
+            params: vec![ColumnData {
+                data: "John".to_string(),
+                data_type: DataType::TEXT,
+            }],
+        };
+
+        // Execute the SQL insert query
+        let result = execute_sql_insert(&query_msg, &conn).await.unwrap();
+
+        // Assert the result
+        assert_eq!(result.rows_affected, 1);
+        assert_eq!(result.status, "OK");
+        assert_eq!(result.column_count, 0);
+        assert_eq!(
+            result.column_names,
+            std::vec::Vec::<std::string::String>::new()
+        );
+        assert_eq!(result.rows.len(), 0);
+
+        conn.lock()
+            .unwrap()
+            .execute("DROP TABLE users", [])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_client_server() {
+        let url = "127.0.0.1:8080";
+
+        tokio::spawn(async {
+            let server = Server::new(url).await.unwrap();
+
+            server
+                .conn
+                .lock()
+                .unwrap()
+                .execute("DROP TABLE users", [])
+                .ok();
+
+            // Insert test data into the database
+            server
+                .conn
+                .lock()
+                .unwrap()
+                .execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
+                .unwrap();
+            server
+                .conn
+                .lock()
+                .unwrap()
+                .execute("INSERT INTO users (name) VALUES ('John'), ('Jane')", [])
+                .unwrap();
+
+            tokio::spawn(async {
+                run_server(server).await.unwrap();
+            });
+        })
+        .await
+        .unwrap();
+
+        let req_params = [];
+        let mut client = alesia_client::new_from_url(url).await;
+
+        let result = client
+            .query("SELECT * FROM users", &req_params)
+            .await
+            .unwrap();
+
+        // Assert the result
+        assert_eq!(result[0].get_by_name("name").data, "John");
+        assert_eq!(result[1].get_by_name("name").data, "Jane");
     }
 }
