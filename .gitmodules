@@ -1,0 +1,3 @@
+[submodule "AlesiaDB_Client"]
+	path = AlesiaDB_Client
+	url = https://github.com/Pietrohl/AlesiaDB_Client.git

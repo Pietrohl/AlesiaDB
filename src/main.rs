@@ -1,22 +1,20 @@
-pub mod types;
-use crate::types::dto::{ColumnData, QueryDTO, ResponseDTO};
+use alesia_client::types::dto::{ColumnData, DataType, QueryType, RequestDTO};
+use alesia_client::types::dto::{ResponseDTO, TableRowDTO};
+use rusqlite::params_from_iter;
+use rusqlite::types::ToSql;
 use rusqlite::Connection;
 use std::borrow::Borrow;
 use std::str::from_utf8;
 use std::vec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use types::dto::{DataType, TableRow};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // print_test();
-
-    let listener = TcpListener::bind("127.0.0.1:8080").await?;
-    println!("Server started on 127.0.0.1:8080");
+    let server = Server::new("localhost:8080").await?;
 
     loop {
-        let (socket, _) = listener.accept().await?;
+        let (socket, _) = server.listener.accept().await?;
         println!("Accepted connection from: {}", socket.peer_addr()?);
 
         tokio::spawn(async move {
@@ -24,6 +22,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Error handling client: {}", e);
             }
         });
+    }
+}
+
+struct Server {
+    listener: TcpListener,
+}
+
+impl Server {
+    pub async fn new(url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(url).await?;
+        println!("Server started on {url}");
+
+        Ok(Server { listener })
     }
 }
 
@@ -44,7 +55,7 @@ async fn handle_client(mut socket: TcpStream) -> Result<(), Box<dyn std::error::
             .map_or_else(|e| format!("Error handling message: {}", e), |r| r);
 
         socket.write_all(result.as_bytes()).await?;
-        socket.write_all(b"\n").await?;
+        // socket.write_all(b"\n").await?;
     }
 }
 
@@ -54,9 +65,15 @@ async fn handle_message(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let msg = String::from_utf8((&bytes[..n]).to_vec())?;
 
-    let query: QueryDTO = serde_json::from_str(&msg)?;
+    let query: RequestDTO = serde_json::from_str(&msg)?;
 
-    let response = match execute_sql_query(&query).await {
+    let result = match query.query_type {
+        QueryType::QUERY => execute_sql_query(&query).await,
+        QueryType::EXEC => execute_sql_stm(&query).await,
+        QueryType::INSERT => execute_sql_insert(&query),
+    };
+
+    let response = match result {
         Ok(result) => serde_json::to_string(&result)?,
         Err(err) => format!("Error: {}", err),
     };
@@ -64,8 +81,35 @@ async fn handle_message(
     Ok(response)
 }
 
+async fn execute_sql_stm(
+    query_msg: &RequestDTO,
+) -> Result<ResponseDTO, Box<dyn std::error::Error>> {
+    let conn: Connection = Connection::open("sqlite.db").unwrap();
+
+    let mut stmt = conn.prepare(query_msg.query.as_ref()).unwrap();
+
+    for i in 0..query_msg.params.len() {
+        let err = stmt.raw_bind_parameter(i + 1, query_msg.params[i].data.to_sql()?);
+
+        if let Err(err) = err {
+            println!("Error: {}", err);
+        }
+    }
+
+    match stmt.raw_execute() {
+        Ok(rows_affected) => Ok(ResponseDTO {
+            rows_affected,
+            status: "OK".to_string(),
+            rows: vec![],
+            column_count: 0,
+            column_names: vec![],
+        }),
+        Err(err) => Err(Box::new(err)),
+    }
+}
+
 async fn execute_sql_query(
-    query_msg: &QueryDTO,
+    query_msg: &RequestDTO,
 ) -> Result<ResponseDTO, Box<dyn std::error::Error>> {
     let conn: Connection = Connection::open("sqlite.db")?;
 
@@ -73,7 +117,7 @@ async fn execute_sql_query(
         let mut stmt = conn.prepare(query_msg.query.as_ref())?;
 
         for i in 0..query_msg.params.len() {
-            let err = stmt.raw_bind_parameter(i + 1, 1);
+            let err = stmt.raw_bind_parameter(i + 1, query_msg.params[i].data.to_sql()?);
 
             if let Err(err) = err {
                 return Err(Box::new(err));
@@ -81,16 +125,24 @@ async fn execute_sql_query(
         }
 
         let column_count = stmt.borrow().column_count();
+        let column_names = stmt
+            .borrow()
+            .column_names()
+            .into_iter()
+            .map(|x| x.to_string())
+            .collect();
 
         let mut rows = stmt.raw_query();
         let mut result = ResponseDTO {
+            rows_affected: 0,
             status: "OK".to_string(),
             rows: vec![],
             column_count,
+            column_names,
         };
 
         while let Some(row) = rows.next()? {
-            let mut new_table_row = TableRow { columns: vec![] };
+            let mut new_table_row = TableRowDTO { columns: vec![] };
 
             for i in 0..result.column_count {
                 let value: ColumnData = match row.get_ref::<usize>(i).unwrap().data_type() {
@@ -141,22 +193,30 @@ async fn execute_sql_query(
         Ok(result)
     }
 }
-// fn print_test() -> Vec<u8> {
-//     let message = QueryDTO {
-//         query: "SELECT * FROM clients WHERE id = ?1;".to_string().into(),
-//         params: vec![ColumnData {
-//             data: "1".into(),
-//             data_type: DataType::INTEGER,
-//         }],
-//     };
 
-//     let result = serde_json::to_string(&message).unwrap();
-//     let result_as_bytes = result.as_bytes();
+fn execute_sql_insert(query_msg: &RequestDTO) -> Result<ResponseDTO, Box<dyn std::error::Error>> {
+    let conn: Connection = Connection::open("sqlite.db")?;
 
-//     println!(
-//         "The message should be: {0}",
-//         from_utf8(&result_as_bytes).unwrap()
-//     );
+    let mut stmt = conn.prepare(&query_msg.query)?;
 
-//     return result_as_bytes.into();
-// }
+    for i in 0..query_msg.params.len() {
+        let err = stmt.raw_bind_parameter(i + 1, query_msg.params[i].data.to_sql()?);
+
+        if let Err(err) = err {
+            return Err(Box::new(err));
+        }
+    }
+
+    match stmt.insert(params_from_iter(
+        query_msg.params.iter().map(|x| x.data.to_sql().unwrap()),
+    )) {
+        Ok(_) => Ok(ResponseDTO {
+            rows_affected: 1,
+            status: "OK".to_string(),
+            rows: vec![],
+            column_count: 0,
+            column_names: vec![],
+        }),
+        Err(err) => Err(Box::new(err)),
+    }
+}
