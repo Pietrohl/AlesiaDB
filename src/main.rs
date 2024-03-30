@@ -65,13 +65,12 @@ async fn handle_client(
             return Ok(());
         }
 
-        let result: String = handle_message(&bytes, n - 1, conn)
+        let result: String = handle_message(&bytes, n, conn)
             .await
             .map_or_else(|e| format!("Error handling message: {}", e), |r| r);
 
-        println!("Result: {}", result);
         socket.write_all(result.as_bytes()).await?;
-        // socket.write_all(b"\n").await?;
+        socket.flush().await?;
     }
 }
 
@@ -81,6 +80,8 @@ async fn handle_message(
     conn: &Arc<Mutex<Connection>>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let msg = String::from_utf8((&bytes[..n]).to_vec())?;
+
+    // println!("MSG: {}", &msg);
 
     let query: RequestDTO = serde_json::from_str(&msg)?;
 
@@ -243,7 +244,6 @@ async fn execute_sql_insert(
 
 #[cfg(test)]
 mod tests {
-    use std::os::windows::thread;
 
     use super::*;
     #[tokio::test]
