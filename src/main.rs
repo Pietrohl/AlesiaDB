@@ -1,3 +1,5 @@
+use alesia_client::connection::BackendMessage;
+use alesia_client::errors::{AlesiaError, Error};
 use alesia_client::types::dto::{ColumnData, DataType, QueryType, RequestDTO};
 use alesia_client::types::dto::{ResponseDTO, TableRowDTO};
 use rusqlite::types::ToSql;
@@ -74,36 +76,28 @@ async fn handle_client<'a>(
             return Ok(());
         }
 
-        let result: String = handle_message(&bytes, n, &conn)
-            .await
-            .map_or_else(|e| format!("Error handling message: {}", e), |r| r);
+        let result: BackendMessage = match handle_message(&bytes[..n], &conn).await.map_err(|e| e) {
+            Ok(response) => BackendMessage::success(response),
+            Err(e) => BackendMessage::error(e),
+        };
 
         socket.write_all(result.as_bytes()).await?;
         socket.flush().await?;
     }
 }
 
-async fn handle_message(
-    bytes: &[u8; 1024],
-    n: usize,
-    conn: &Arc<Mutex<Connection>>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let msg = String::from_utf8((&bytes[..n]).to_vec())?;
-
-    // println!("MSG: {}", &msg);
-
-    let query: RequestDTO = serde_json::from_str(&msg)?;
+async fn handle_message(msg: &[u8], conn: &Arc<Mutex<Connection>>) -> Result<String, Error> {
+    let query = serde_json::from_slice::<RequestDTO>(msg)
+        .map_err(|e| Error::IoError(AlesiaError::from(e.to_string().as_str())))?;
 
     let result = match query.query_type {
-        QueryType::QUERY => execute_sql_query(&query, conn).await,
-        QueryType::EXEC => execute_sql_stm(&query, conn).await,
-        QueryType::INSERT => execute_sql_insert(&query, conn).await,
+        QueryType::QUERY => execute_sql_query(&query, conn).await?,
+        QueryType::EXEC => execute_sql_stm(&query, conn).await?,
+        QueryType::INSERT => execute_sql_insert(&query, conn).await?,
     };
 
-    let response = match result {
-        Ok(result) => serde_json::to_string(&result)?,
-        Err(err) => format!("Error: {}", err),
-    };
+    let response = serde_json::to_string(&result)
+        .map_err(|e| Error::IoError(AlesiaError::from(e.to_string().as_str())))?;
 
     Ok(response)
 }
@@ -111,7 +105,7 @@ async fn handle_message(
 async fn execute_sql_stm(
     query_msg: &RequestDTO,
     conn: &Arc<Mutex<Connection>>,
-) -> Result<ResponseDTO, Box<dyn std::error::Error>> {
+) -> Result<ResponseDTO, Error> {
     let conn_lock = conn.lock().await;
 
     // if conn_lock.isbusy() wait 5ms and try again, repeat 10 times
@@ -122,7 +116,7 @@ async fn execute_sql_stm(
     }
 
     if conn_lock.is_busy() {
-        return Err(Box::new(rusqlite::Error::SqliteFailure(
+        return Err(Error::RusqliteError(rusqlite::Error::SqliteFailure(
             ffi::Error {
                 code: ffi::ErrorCode::DatabaseBusy,
                 extended_code: 0,
@@ -149,14 +143,14 @@ async fn execute_sql_stm(
             column_count: 0,
             column_names: vec![],
         }),
-        Err(err) => Err(Box::new(err)),
+        Err(err) => Err(Error::RusqliteError(err)),
     }
 }
 
 async fn execute_sql_query(
     query_msg: &RequestDTO,
     conn: &Arc<Mutex<Connection>>,
-) -> Result<ResponseDTO, Box<dyn std::error::Error>> {
+) -> Result<ResponseDTO, Error> {
     let conn_lock = conn.lock().await;
 
     {
@@ -166,7 +160,7 @@ async fn execute_sql_query(
             let err = stmt.raw_bind_parameter(i + 1, query_msg.params[i].data.to_sql()?);
 
             if let Err(err) = err {
-                return Err(Box::new(err));
+                return Err(Error::RusqliteError(err));
             }
         }
 
@@ -243,7 +237,7 @@ async fn execute_sql_query(
 async fn execute_sql_insert(
     query_msg: &RequestDTO,
     conn: &Arc<Mutex<Connection>>,
-) -> Result<ResponseDTO, Box<dyn std::error::Error>> {
+) -> Result<ResponseDTO, Error> {
     let conn_lock = conn.lock().await;
     let mut stmt = conn_lock.prepare(&query_msg.query)?;
 
@@ -251,7 +245,7 @@ async fn execute_sql_insert(
         let err = stmt.raw_bind_parameter(i + 1, query_msg.params[i].data.to_sql()?);
 
         if let Err(err) = err {
-            return Err(Box::new(err));
+            return Err(Error::RusqliteError(err));
         }
     }
 
@@ -265,7 +259,7 @@ async fn execute_sql_insert(
             column_count: 0,
             column_names: vec![],
         }),
-        Err(err) => Err(Box::new(err)),
+        Err(err) => Err(Error::RusqliteError(err)),
     }
 }
 
@@ -368,7 +362,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_server() {
-        let url = "http://localhost:8080";
+        let url = "127.0.0.1:8080";
 
         tokio::spawn(async {
             let server = Server::new(url).await.unwrap();
@@ -392,7 +386,7 @@ mod tests {
         .unwrap();
 
         let req_params = [];
-        let mut client = alesia_client::new_from_url(url).await;
+        let mut client = alesia_client::new_from_url(url).await.unwrap();
 
         let result = client
             .query("SELECT * FROM users", &req_params)
