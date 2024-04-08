@@ -1,3 +1,5 @@
+use alesia_client::connection::BackendMessage;
+use alesia_client::errors::{AlesiaError, Error};
 use alesia_client::types::dto::{ColumnData, DataType, QueryType, RequestDTO};
 use alesia_client::types::dto::{ResponseDTO, TableRowDTO};
 use rusqlite::params_from_iter;
@@ -65,35 +67,28 @@ async fn handle_client(
             return Ok(());
         }
 
-        let result: String = handle_message(&bytes, n - 1, conn)
-            .await
-            .map_or_else(|e| format!("Error handling message: {}", e), |r| r);
+        let result: BackendMessage = match handle_message(&bytes[..n], conn).await.map_err(|e| e) {
+            Ok(response) => BackendMessage::success(response),
+            Err(e) => BackendMessage::error(e),
+        };
 
-        println!("Result: {}", result);
         socket.write_all(result.as_bytes()).await?;
-        // socket.write_all(b"\n").await?;
+        socket.flush().await?;
     }
 }
 
-async fn handle_message(
-    bytes: &[u8; 1024],
-    n: usize,
-    conn: &Arc<Mutex<Connection>>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let msg = String::from_utf8((&bytes[..n]).to_vec())?;
-
-    let query: RequestDTO = serde_json::from_str(&msg)?;
+async fn handle_message(msg: &[u8], conn: &Arc<Mutex<Connection>>) -> Result<String, Error> {
+    let query = serde_json::from_slice::<RequestDTO>(msg)
+        .map_err(|e| Error::IoError(AlesiaError::from(e.to_string().as_str())))?;
 
     let result = match query.query_type {
-        QueryType::QUERY => execute_sql_query(&query, conn).await,
-        QueryType::EXEC => execute_sql_stm(&query, conn).await,
-        QueryType::INSERT => execute_sql_insert(&query, conn).await,
+        QueryType::QUERY => execute_sql_query(&query, conn).await?,
+        QueryType::EXEC => execute_sql_stm(&query, conn).await?,
+        QueryType::INSERT => execute_sql_insert(&query, conn).await?,
     };
 
-    let response = match result {
-        Ok(result) => serde_json::to_string(&result)?,
-        Err(err) => format!("Error: {}", err),
-    };
+    let response = serde_json::to_string(&result)
+        .map_err(|e| Error::IoError(AlesiaError::from(e.to_string().as_str())))?;
 
     Ok(response)
 }
@@ -101,7 +96,7 @@ async fn handle_message(
 async fn execute_sql_stm(
     query_msg: &RequestDTO,
     conn: &Arc<Mutex<Connection>>,
-) -> Result<ResponseDTO, Box<dyn std::error::Error>> {
+) -> Result<ResponseDTO, Error> {
     let conn_lock = conn.lock().unwrap();
     let mut stmt = conn_lock.prepare(query_msg.query.as_ref()).unwrap();
 
@@ -121,14 +116,14 @@ async fn execute_sql_stm(
             column_count: 0,
             column_names: vec![],
         }),
-        Err(err) => Err(Box::new(err)),
+        Err(err) => Err(Error::RusqliteError(err)),
     }
 }
 
 async fn execute_sql_query(
     query_msg: &RequestDTO,
     conn: &Arc<Mutex<Connection>>,
-) -> Result<ResponseDTO, Box<dyn std::error::Error>> {
+) -> Result<ResponseDTO, Error> {
     let conn_lock = conn.lock().unwrap();
 
     {
@@ -138,7 +133,7 @@ async fn execute_sql_query(
             let err = stmt.raw_bind_parameter(i + 1, query_msg.params[i].data.to_sql()?);
 
             if let Err(err) = err {
-                return Err(Box::new(err));
+                return Err(Error::RusqliteError(err));
             }
         }
 
@@ -215,7 +210,7 @@ async fn execute_sql_query(
 async fn execute_sql_insert(
     query_msg: &RequestDTO,
     conn: &Arc<Mutex<Connection>>,
-) -> Result<ResponseDTO, Box<dyn std::error::Error>> {
+) -> Result<ResponseDTO, Error> {
     let conn_lock = conn.lock().unwrap();
     let mut stmt = conn_lock.prepare(&query_msg.query)?;
 
@@ -223,7 +218,7 @@ async fn execute_sql_insert(
         let err = stmt.raw_bind_parameter(i + 1, query_msg.params[i].data.to_sql()?);
 
         if let Err(err) = err {
-            return Err(Box::new(err));
+            return Err(Error::RusqliteError(err));
         }
     }
 
@@ -237,13 +232,12 @@ async fn execute_sql_insert(
             column_count: 0,
             column_names: vec![],
         }),
-        Err(err) => Err(Box::new(err)),
+        Err(err) => Err(Error::RusqliteError(err)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::os::windows::thread;
 
     use super::*;
     #[tokio::test]
@@ -381,7 +375,7 @@ mod tests {
         .unwrap();
 
         let req_params = [];
-        let mut client = alesia_client::new_from_url(url).await;
+        let mut client = alesia_client::new_from_url(url).await.unwrap();
 
         let result = client
             .query("SELECT * FROM users", &req_params)
