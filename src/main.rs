@@ -14,42 +14,76 @@ use tokio::sync::Mutex;
 
 type SafeConnection = Arc<Mutex<Connection>>;
 
+#[derive(Debug, Clone)]
+struct ServerConfig {
+    socket_address: String,
+}
+
+#[derive(Debug, Clone)]
 struct DatabaseConfig {
     path: String,
 }
 
+#[derive(Debug, Clone)]
+struct ConfigState(DatabaseConfig, ServerConfig);
+
+impl Default for ConfigState {
+    fn default() -> Self {
+        ConfigState(
+            DatabaseConfig {
+                path: "sqlite.db".to_string(),
+            },
+            ServerConfig {
+                socket_address: "127.0.0.1:8080".to_string(),
+            },
+        )
+    }
+}
+
+impl ConfigState {
+    fn init_from_env() -> ConfigState {
+        let path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "sqlite.db".to_string());
+        let socket_address =
+            std::env::var("ADDRESS").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+
+        let db_config = DatabaseConfig { path };
+        let server_config = ServerConfig { socket_address };
+
+        ConfigState(db_config, server_config)
+    }
+}
+
 struct Server {
     listener: TcpListener,
-    db_config: DatabaseConfig,
 }
 
 impl Server {
-    pub async fn new(url: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind(url).await?;
-        println!("Server started on {url}");
+    pub async fn new(config: &ServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(&config.socket_address).await?;
+        println!("Server started on {}", &config.socket_address);
 
-        Ok(Server {
-            listener,
-            db_config: DatabaseConfig {
-                path: String::from("sqlite.db"),
-            },
-        })
+        Ok(Server { listener })
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let server: Server = Server::new("127.0.0.1:8080").await?;
+    let config = ConfigState::init_from_env();
 
-    run_server(server).await
+    let server: Server = Server::new(&config.1).await?;
+
+    run_server(server, &config).await
 }
 
-async fn run_server(server: Server) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_server(
+    server: Server,
+    ConfigState(db_config, _): &ConfigState,
+) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (socket, _) = server.listener.accept().await?;
         println!("Accepted connection from: {}", socket.peer_addr()?);
 
-        let path = server.db_config.path.to_owned();
+        let path = db_config.path.to_owned();
         tokio::spawn(async move {
             if let Err(e) = handle_client(socket, &path).await {
                 eprintln!("Error handling client: {}", e);
@@ -349,8 +383,15 @@ mod tests {
     #[tokio::test]
     async fn test_client_server() {
         let url = "127.0.0.1:8080";
+        let server_config = ServerConfig {
+            socket_address: url.into(),
+        };
+        let database_path = "sqlite.db";
+        let db_config = DatabaseConfig {
+            path: database_path.into(),
+        };
 
-        let conn = Connection::open("sqlite.db").unwrap();
+        let conn = Connection::open(database_path).unwrap();
         conn.execute("DROP TABLE users", []).ok();
         // Insert test data into the database
         conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
@@ -358,14 +399,14 @@ mod tests {
         conn.execute("INSERT INTO users (name) VALUES ('John'), ('Jane')", [])
             .unwrap();
         conn.close().unwrap();
-        let server = Server::new(url).await.unwrap();
 
-        tokio::spawn(async {
-            run_server(server).await.unwrap();
+        tokio::spawn(async move {
+            let config = ConfigState(db_config, server_config);
+            let server = Server::new(&config.1).await.unwrap();
+            run_server(server, &config).await.unwrap();
         });
 
         // Create a client
-
         let req_params = [];
         let mut client = alesia_client::new_from_url(url).await.unwrap();
 
