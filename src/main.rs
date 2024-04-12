@@ -1,5 +1,5 @@
-use alesia_client::connection::BackendMessage;
-use alesia_client::errors::{AlesiaError, Error};
+use alesia_client::connection::{Deserialize, Serialize};
+use alesia_client::errors::Error;
 use alesia_client::types::dto::{ColumnData, DataType, QueryType, RequestDTO};
 use alesia_client::types::dto::{ResponseDTO, TableRowDTO};
 use rusqlite::types::ToSql;
@@ -8,11 +8,9 @@ use rusqlite::{ffi, params_from_iter};
 use std::borrow::Borrow;
 use std::str::from_utf8;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::time::Duration;
-use std::vec;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 
 type SafeConnection = Arc<Mutex<Connection>>;
 
@@ -61,45 +59,33 @@ async fn run_server(server: Server) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn handle_client<'a>(
-    mut socket: TcpStream,
+    socket: TcpStream,
     path: &'a str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut bytes = [0; 1024];
     let addr = socket.peer_addr()?;
     println!("Handling client: {}", addr);
     let conn: SafeConnection = Arc::new(Mutex::new(Connection::open(path)?));
-
+    let (mut reader, mut writer) = socket.into_split();
     loop {
-        let n = socket.read(&mut bytes).await?;
-        if n == 0 {
-            println!("Client disconnected: {}", addr);
-            return Ok(());
-        }
+        let message = RequestDTO::deserialize(&mut reader).await?;
 
-        let result: BackendMessage = match handle_message(&bytes[..n], &conn).await.map_err(|e| e) {
-            Ok(response) => BackendMessage::success(response),
-            Err(e) => BackendMessage::error(e),
-        };
+        let reponse_message = handle_message(message, &conn).await?;
 
-        socket.write_all(result.as_bytes()).await?;
-        socket.flush().await?;
+        reponse_message.serialize(&mut writer).await?;
     }
 }
 
-async fn handle_message(msg: &[u8], conn: &Arc<Mutex<Connection>>) -> Result<String, Error> {
-    let query = serde_json::from_slice::<RequestDTO>(msg)
-        .map_err(|e| Error::IoError(AlesiaError::from(e.to_string().as_str())))?;
-
+async fn handle_message(
+    query: RequestDTO,
+    conn: &Arc<Mutex<Connection>>,
+) -> Result<ResponseDTO, Error> {
     let result = match query.query_type {
         QueryType::QUERY => execute_sql_query(&query, conn).await?,
         QueryType::EXEC => execute_sql_stm(&query, conn).await?,
         QueryType::INSERT => execute_sql_insert(&query, conn).await?,
     };
 
-    let response = serde_json::to_string(&result)
-        .map_err(|e| Error::IoError(AlesiaError::from(e.to_string().as_str())))?;
-
-    Ok(response)
+    Ok(result)
 }
 
 async fn execute_sql_stm(
@@ -364,26 +350,21 @@ mod tests {
     async fn test_client_server() {
         let url = "127.0.0.1:8080";
 
+        let conn = Connection::open("sqlite.db").unwrap();
+        conn.execute("DROP TABLE users", []).ok();
+        // Insert test data into the database
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO users (name) VALUES ('John'), ('Jane')", [])
+            .unwrap();
+        conn.close().unwrap();
+        let server = Server::new(url).await.unwrap();
+
         tokio::spawn(async {
-            let server = Server::new(url).await.unwrap();
-            let conn = Connection::open("sqlite.db").unwrap();
+            run_server(server).await.unwrap();
+        });
 
-            conn.execute("DROP TABLE users", []).ok();
-
-            // Insert test data into the database
-            conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
-                .unwrap();
-            conn.execute("INSERT INTO users (name) VALUES ('John'), ('Jane')", [])
-                .unwrap();
-
-            conn.close().unwrap();
-
-            tokio::spawn(async {
-                run_server(server).await.unwrap();
-            });
-        })
-        .await
-        .unwrap();
+        // Create a client
 
         let req_params = [];
         let mut client = alesia_client::new_from_url(url).await.unwrap();
