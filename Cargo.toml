@@ -9,5 +9,8 @@ rusqlite = {version = "0.31.0", features = ["bundled"]}
 serde = {version = "1.0.196", features = ["derive"]}
 serde_json = "1.0.114"
 tokio = { version = "1", features = ["full"] }
-alesia_client = {path = "./AlesiaDB_Client/alesia_client"}
+alesia_client = {path = "../alesia_client/alesia_client"}
+rustls-pemfile = "2.1.2"
+tokio-rustls = {version = "0.26.0", default-features = false, features = ["ring"]}
+
 

@@ -6,17 +6,19 @@ use rusqlite::types::ToSql;
 use rusqlite::Connection;
 use rusqlite::{ffi, params_from_iter};
 use std::borrow::Borrow;
+use std::fs::File;
+use std::io::BufReader;
 use std::str::from_utf8;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
-
-type SafeConnection = Arc<Mutex<Connection>>;
+use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio_rustls::{rustls, TlsAcceptor};
 
 #[derive(Debug, Clone)]
 struct ServerConfig {
     socket_address: String,
+    tls_config: Option<rustls::ServerConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +37,7 @@ impl Default for ConfigState {
             },
             ServerConfig {
                 socket_address: "127.0.0.1:8080".to_string(),
+                tls_config: None,
             },
         )
     }
@@ -46,8 +49,44 @@ impl ConfigState {
         let socket_address =
             std::env::var("ADDRESS").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
 
+        let tls = std::env::var("TLS")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse()
+            .unwrap();
+
+        let tls_config = if tls {
+            let cert_file =
+                std::env::var("TLS_CERT_PATH").expect("missing certificate file argument");
+            let private_key_file =
+                std::env::var("PRIVATE_KEY_PATH").expect("missing private key file argument");
+
+            let certs = rustls_pemfile::certs(&mut BufReader::new(
+                &mut File::open(cert_file).expect("Certificate file not found"),
+            ))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Error reading certificate file");
+
+            let private_key = rustls_pemfile::private_key(&mut BufReader::new(
+                &mut File::open(private_key_file).expect("Private key file not found"),
+            ))
+            .expect("Error reading private key file")
+            .expect("No private key found on file");
+
+            Some(
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, private_key)
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+
         let db_config = DatabaseConfig { path };
-        let server_config = ServerConfig { socket_address };
+        let server_config = ServerConfig {
+            socket_address,
+            tls_config,
+        };
 
         ConfigState(db_config, server_config)
     }
@@ -55,14 +94,21 @@ impl ConfigState {
 
 struct Server {
     listener: TcpListener,
+    acceptor: Option<Arc<TlsAcceptor>>,
 }
 
 impl Server {
     pub async fn new(config: &ServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let acceptor: Option<Arc<TlsAcceptor>> = match config.tls_config.clone() {
+            Some(tls_config) => Some(Arc::new(TlsAcceptor::from(Arc::new(tls_config)))),
+            None => None,
+        };
+
         let listener = TcpListener::bind(&config.socket_address).await?;
+
         println!("Server started on {}", &config.socket_address);
 
-        Ok(Server { listener })
+        Ok(Server { listener, acceptor })
     }
 }
 
@@ -80,39 +126,71 @@ async fn run_server(
     ConfigState(db_config, _): &ConfigState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        let (socket, _) = server.listener.accept().await?;
-        println!("Accepted connection from: {}", socket.peer_addr()?);
+        let (socket, peer_addr) = server.listener.accept().await?;
 
         let path = db_config.path.to_owned();
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(socket, &path).await {
-                eprintln!("Error handling client: {}", e);
-            }
-        });
+
+        println!("Accepted connection from: {}", peer_addr);
+
+        if let Some(acceptor) = server.acceptor.clone() {
+            let acceptor = acceptor.clone();
+            let socket = Box::new(acceptor.accept(socket).await?);
+            tokio::spawn(async move {
+                if let Err(e) = handle_client(socket, &path, peer_addr).await {
+                    eprintln!("Error handling client: {}", e);
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(e) = handle_client(socket, &path, peer_addr).await {
+                    eprintln!("Error handling client: {}", e);
+                }
+            });
+        }
     }
 }
 
-async fn handle_client<'a>(
-    socket: TcpStream,
+async fn handle_client<'a, T: AsyncReadExt + AsyncWriteExt + Send + Sync>(
+    socket: T,
     path: &'a str,
+    addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = socket.peer_addr()?;
     println!("Handling client: {}", addr);
-    let conn: SafeConnection = Arc::new(Mutex::new(Connection::open(path)?));
-    let (mut reader, mut writer) = socket.into_split();
+    let mut conn = Connection::open(path)?;
+    let (mut reader, mut writer) = split(socket);
     loop {
         let message = RequestDTO::deserialize(&mut reader).await?;
 
-        let reponse_message = handle_message(message, &conn).await?;
+        let reponse_message = handle_message(message, &mut conn).await;
 
-        reponse_message.serialize(&mut writer).await?;
+        match reponse_message {
+            Ok(response) => response.serialize(&mut writer).await?,
+            Err(e) => {
+                println!("Error: {:?}", e);
+                e.serialize(&mut writer).await?
+            }
+        }
     }
 }
 
-async fn handle_message(
-    query: RequestDTO,
-    conn: &Arc<Mutex<Connection>>,
-) -> Result<ResponseDTO, Error> {
+async fn handle_message(query: RequestDTO, conn: &mut Connection) -> Result<ResponseDTO, Error> {
+    // if conn_lock.isbusy() wait 5ms and try again, repeat 100 times
+    let mut retries = 0;
+    while conn.is_busy() && retries < 100 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        retries += 1;
+    }
+
+    if conn.is_busy() {
+        return Err(Error::RusqliteError(rusqlite::Error::SqliteFailure(
+            ffi::Error {
+                code: ffi::ErrorCode::DatabaseBusy,
+                extended_code: 0,
+            },
+            Some("Database is busy".to_string()),
+        )));
+    }
+
     let result = match query.query_type {
         QueryType::QUERY => execute_sql_query(&query, conn).await?,
         QueryType::EXEC => execute_sql_stm(&query, conn).await?,
@@ -124,28 +202,9 @@ async fn handle_message(
 
 async fn execute_sql_stm(
     query_msg: &RequestDTO,
-    conn: &Arc<Mutex<Connection>>,
+    conn: &mut Connection,
 ) -> Result<ResponseDTO, Error> {
-    let conn_lock = conn.lock().await;
-
-    // if conn_lock.isbusy() wait 5ms and try again, repeat 10 times
-    let mut retries = 0;
-    while conn_lock.is_busy() && retries < 10 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        retries += 1;
-    }
-
-    if conn_lock.is_busy() {
-        return Err(Error::RusqliteError(rusqlite::Error::SqliteFailure(
-            ffi::Error {
-                code: ffi::ErrorCode::DatabaseBusy,
-                extended_code: 0,
-            },
-            Some("Database is busy".to_string()),
-        )));
-    }
-
-    let mut stmt = conn_lock.prepare(query_msg.query.as_ref()).unwrap();
+    let mut stmt = conn.prepare(query_msg.query.as_ref()).unwrap();
 
     for i in 0..query_msg.params.len() {
         let err = stmt.raw_bind_parameter(i + 1, query_msg.params[i].data.to_sql()?);
@@ -169,12 +228,10 @@ async fn execute_sql_stm(
 
 async fn execute_sql_query(
     query_msg: &RequestDTO,
-    conn: &Arc<Mutex<Connection>>,
+    conn: &mut Connection,
 ) -> Result<ResponseDTO, Error> {
-    let conn_lock = conn.lock().await;
-
     {
-        let mut stmt = conn_lock.prepare(query_msg.query.as_ref())?;
+        let mut stmt = conn.prepare(query_msg.query.as_ref())?;
 
         for i in 0..query_msg.params.len() {
             let err = stmt.raw_bind_parameter(i + 1, query_msg.params[i].data.to_sql()?);
@@ -256,10 +313,9 @@ async fn execute_sql_query(
 
 async fn execute_sql_insert(
     query_msg: &RequestDTO,
-    conn: &Arc<Mutex<Connection>>,
+    conn: &mut Connection,
 ) -> Result<ResponseDTO, Error> {
-    let conn_lock = conn.lock().await;
-    let mut stmt = conn_lock.prepare(&query_msg.query)?;
+    let mut stmt = conn.prepare(&query_msg.query)?;
 
     for i in 0..query_msg.params.len() {
         let err = stmt.raw_bind_parameter(i + 1, query_msg.params[i].data.to_sql()?);
@@ -290,7 +346,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_sql_select() {
         // Mock the connection
-        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let mut conn = Connection::open_in_memory().unwrap();
         let query_msg = RequestDTO {
             query: "SELECT * FROM users".to_string(),
             query_type: QueryType::QUERY,
@@ -298,17 +354,13 @@ mod tests {
         };
 
         // Insert test data into the database
-        conn.lock()
-            .await
-            .execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
             .unwrap();
-        conn.lock()
-            .await
-            .execute("INSERT INTO users (name) VALUES ('John'), ('Jane')", [])
+        conn.execute("INSERT INTO users (name) VALUES ('John'), ('Jane')", [])
             .unwrap();
 
         // Execute the SQL select query
-        let result = execute_sql_query(&query_msg, &conn).await.unwrap();
+        let result = execute_sql_query(&query_msg, &mut conn).await.unwrap();
 
         // Assert the result
         assert_eq!(result.rows_affected, 0);
@@ -341,18 +393,16 @@ mod tests {
             DataType::TEXT
         ));
 
-        conn.lock().await.execute("DROP TABLE users", []).unwrap();
+        conn.execute("DROP TABLE users", []).unwrap();
     }
 
     #[tokio::test]
     async fn test_execute_sql_insert() {
         // Mock the connection
-        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let mut conn = Connection::open_in_memory().unwrap();
 
         // Insert test data into the database
-        conn.lock()
-            .await
-            .execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
             .unwrap();
 
         let query_msg = RequestDTO {
@@ -365,7 +415,7 @@ mod tests {
         };
 
         // Execute the SQL insert query
-        let result = execute_sql_insert(&query_msg, &conn).await.unwrap();
+        let result = execute_sql_insert(&query_msg, &mut conn).await.unwrap();
 
         // Assert the result
         assert_eq!(result.rows_affected, 1);
@@ -377,14 +427,15 @@ mod tests {
         );
         assert_eq!(result.rows.len(), 0);
 
-        conn.lock().await.execute("DROP TABLE users", []).unwrap();
+        conn.execute("DROP TABLE users", []).unwrap();
     }
 
     #[tokio::test]
     async fn test_client_server() {
-        let url = "127.0.0.1:8080";
+        let url = "127.0.0.1:3232";
         let server_config = ServerConfig {
             socket_address: url.into(),
+            tls_config: None,
         };
         let database_path = "sqlite.db";
         let db_config = DatabaseConfig {
@@ -405,6 +456,9 @@ mod tests {
             let server = Server::new(&config.1).await.unwrap();
             run_server(server, &config).await.unwrap();
         });
+
+        // Wait for the server to start
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
         // Create a client
         let req_params = [];
